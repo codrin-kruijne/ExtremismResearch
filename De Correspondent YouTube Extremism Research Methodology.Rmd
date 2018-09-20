@@ -1,0 +1,372 @@
+---
+title: "De Correspondent YouTube Extremism Research"
+output: html_notebook
+---
+
+This document describes a proposal for a coherent methodology for researching to what degree the YouTube recommendation system leads people to more extreme content.
+
+```{r}
+# Data reading and converting packages
+library(tidyverse)
+library(stringr)
+library(purrr)
+library(jsonlite) # https://cran.r-project.org/web/packages/jsonlite/jsonlite.pdf
+
+# YouTube API package
+library(tuber) # https://cloud.r-project.org/web/packages/tuber/tuber.pdf
+# Usint the tuber package to access the YouTube API
+# http://soodoku.github.io/tuber/index.html
+yt_oauth(app_id = Sys.getenv("YT_CLIENT_ID"), app_secret = Sys.getenv("YT_CLIENT_SECRET"), token = "")
+
+# Network graph packages
+require(devtools)
+library(readgdf) # https://github.com/mikajoh/readgdf
+library(igraph) # http://igraph.org/r/
+library(networkD3) # https://cran.r-project.org/web/packages/networkD3/networkD3.pdf
+
+# Text Analysis packages
+library(quanteda)
+library(topicmodels)
+
+# Parallel computing
+library(parallel)
+```
+
+# Identifying extreme organisations; 'left' and 'right'
+
+We started with compiling a list of extreme organizations (media, political parties, ngo’s, think tanks). Sources we used were Kafka (a Dutch anti fascist organization), Wikipedia and academic literature. We focused on European organizations and added some well known US YouTube channels.
+
+```{r}
+# Let's take a smaller sample while refining the methodology
+sample_size <- 0.25
+# Reading in list of seed channels; those identified as extreme left or right
+right_channels <- read_csv("Local extremism data/Seed list extreme channels.csv")
+dim(right_channels)
+sample_right_channels <- sample_frac(right_channels, size = sample_size)
+dim(sample_right_channels)
+right_channels <- sample_right_channels # To be removed when switching to whole dataset
+
+left_channels <- read_csv("Local extremism data/lefty_seeds.csv")
+dim(left_channels)
+sample_left_channels <- sample_frac(left_channels, size = sample_size)
+dim(sample_left_channels)
+left_channels <- sample_left_channels # To be removed when switching to whole dataset
+
+# Extracting channeld Ids only
+right_channel_IDs <- right_channels$Id 
+left_channel_IDs <- left_channels$Id
+```
+
+## TO DO Removing wrongly identified extreme channels
+- Game channels
+
+
+## Acquiring channel details
+
+Through the YouTube API we acquire channel details.
+
+```{r}
+
+# Function to gather channel information by ID
+
+gather_channel_details <- function(channel_ID){
+
+  # Channel resources
+  safe_channel_resources <- safely(list_channel_resources)
+  channel_resources <- safe_channel_resources(filter = c(channel_id = channel_ID), part = "contentDetails")
+  print("Channel resources")
+  str(channel_resources)
+  
+  # Channel statistics
+  safe_channel_stats <- safely(get_channel_stats)
+  channel_statistics <- safe_channel_stats(channel_id = channel_ID)
+  print("Channel statistics")
+  str(channel_statistics)
+  
+  # Channel playlists
+  safe_playlists <- safely(get_playlists)
+  channel_playlists <- safe_playlists(filter = c(channel_id = channel_ID))
+  print("Channel playlists")
+  str(channel_playlists)
+  
+  # Channel videos
+  safe_channel_videos <- safely(list_channel_videos)
+  channel_videos <- safe_channel_videos(channel_id = channel_ID, max_results = 51)
+  channel_video_IDs <- as.character(channel_videos$result$contentDetails.videoId)
+  print("Channel video IDs")
+  str(channel_video_IDs)
+  
+  # Return list of results
+  list(channel_resources = channel_resources, channel_statistics = channel_statistics, channel_playlists = channel_playlists, channel_videos = channel_videos)
+
+}
+
+# Gathering channel details using parallel processing
+
+cl <- makeCluster(10)
+
+clusterEvalQ(cl, {library(purrr)
+                  library(tuber)})
+clusterEvalQ(cl, yt_oauth(app_id = Sys.getenv("YT_CLIENT_ID"), app_secret = Sys.getenv("YT_CLIENT_SECRET"), token = ""))
+
+system.time(left_channel_details <- parLapply(cl, left_channel_IDs, gather_channel_details))
+system.time(right_channel_details <- parLapply(cl, right_channel_IDs, gather_channel_details))
+
+stopCluster(cl)
+```
+
+# Extracting required details and building channel video lookup
+
+```{r}
+## Create simplified data frames
+
+# Channel-video lookup data frame
+channel_videos_df <- data.frame(matrix(ncol = 2))
+names(channel_videos_df) <- c("channel_id", "video_id")
+channel_videos_df$channel_id <- as.character(channel_videos_df$channel_id)
+channel_videos_df$video_id <- as.character(channel_videos_df$video_id)
+
+# Function to simplify channel output and build channel-video lookup table
+simplify_channel_details <- function(channel_details_list){
+  
+  # Channel details
+  channel_df <- data.frame(matrix(ncol = 3, nrow = length(channel_details_list)))
+  names(channel_df) <- c("channel_id", "channel_title", "channel_description")
+  str(channel_df)
+  
+  # Extract channel details
+  for (i in seq_along(channel_details_list)){
+    print(paste("Processing channel index: ", i))
+    tryCatch(channel_df[i, "channel_id"] <- channel_details_list[[i]]$channel_resources$result$items[[1]]$id, error = function(e) print("Error"))
+    tryCatch(channel_df[i, "channel_title"] <- channel_details_list[[i]]$channel_statistics$result$snippet$title, error = function(e) print("Error"))
+    tryCatch(channel_df[i, "channel_description"] <- channel_details_list[[i]]$channel_statistics$result$snippet$description, error = function(e) print("Error"))
+  }
+  
+  # Extend channel-video lookup data frame
+  channel_videos <- data.frame(matrix(ncol = 2, nrow = length(channel_details_list[[1]]$channel_videos$result$contentDetails.videoId)))
+  names(channel_videos) <- c("channel_id", "video_id")
+  channel_videos[1] <- channel_details_list[[i]]$channel_resources$result$items[[1]]$id
+  channel_videos[2] <- as.character(channel_details_list[[1]]$channel_videos$result$contentDetails.videoId)
+  
+  str(channel_videos_df)
+  str(channel_videos)
+  
+  list(channel_df, channel_videos)
+}
+
+# Simplify channel output
+simplified_left_data <- simplify_channel_details(left_channel_details)
+left_channels_data <- simplified_left_data[[1]]
+channel_videos_df <- rbind(channel_videos_df, simplified_left_data[[2]])
+
+simplified_right_data <- simplify_channel_details(right_channel_details)
+right_channels_data <- simplified_left_data[[1]]
+
+channel_videos_df <- rbind(channel_videos_df, simplified_right_data[[2]])
+
+```
+
+## Gathering video details
+
+```{r}
+# To avoid double downloading identify unique videos
+
+unique_video_IDs <- unique(channel_videos_df$video_id)
+str(unique_video_IDs)
+
+# Function to gather video details by ID
+
+gather_video_details <- function(video_ID){
+  
+  video_id <- video_ID
+  
+  # Video information
+  safe_video_details <- safely(get_video_details)
+  video_details <- safe_video_details(video_id = as.character(video_ID))
+  print("Video details")
+  str(video_details)
+  
+  # Video tags
+  video_tags <- unlist(video_details$items[[1]]$snippet$tags)
+  print("Video tags")
+  str(video_tags)
+
+  #Video tracks and captions
+  safe_caption_tracks <- safely(list_caption_tracks)
+  video_tracks <- safe_caption_tracks(video_id = as.character(video_ID))
+  print("Video caption tracks")
+  str(video_tracks)
+  
+  # Video captions
+  safe_captions <- safely(get_captions)
+  video_captions <- safe_captions(id = as.character(video_tracks[[i]]$id[[1]]), tlang = "en")
+  print("Video captions")
+  str(video_captions)
+  
+  # Return list of results
+  list(video_id = video_id, video_details = video_details, video_tags = video_tags, video_tracks = video_tracks, video_captions = video_captions)
+  
+}
+
+# Gather unique video details
+
+cl <- makeCluster(10)
+
+clusterEvalQ(cl, {library(purrr)
+                  library(tuber)})
+clusterEvalQ(cl, yt_oauth(app_id = Sys.getenv("YT_CLIENT_ID"), app_secret = Sys.getenv("YT_CLIENT_SECRET"), token = ""))
+
+system.time(video_details <- parLapply(cl, unique_video_IDs, gather_video_details))
+
+stopCluster(cl)
+
+# Simplify video details output
+
+simplify_video_details <- function(video_details_list){
+  
+  # Video details
+  video_df <- data.frame(matrix(ncol = 5, nrow = length(video_details_list)))
+  names(video_df) <- c("video_id", "video_title", "video_description", "video_tags", "video_transcript")
+  
+  # Extract channel details
+  for (i in seq_along(video_details_list)){
+    video_df[i, "video_id"] <- video_details_list[[i]]$video_id
+    video_df[i, "video_title"] <- video_details_list[[i]]$video_details$result$items[[1]]$snippet$title
+    video_df[i, "video_description"] <- video_details_list[[i]]$video_details$result$items[[1]]$snippet$description
+    video_df[i, "video_tags"] <- paste(video_details_list[[i]]$video_details$result$items[[1]]$snippet$tags, collapse = " ")
+    video_df[i, "video_transcript"] <- ifelse(!is.null(video_details_list[[i]]$video_captions$result), rawToChar(video_details_list[[i]]$video_captions$result), "")
+  }
+  
+  video_df
+}
+
+video_data <- simplify_video_details(video_details[-1])
+head(video_data)
+```
+
+## Generate corpus
+
+All channel and video details need to be combined in a corpus to be analysed.
+
+```{r}
+
+# Preprocess text
+video_data$video_transcript <- str_replace_all(video_data$video_transcript, pattern = "(\\n\\n)*\\d\\:\\d{2}\\:\\d{2}\\.\\d{3}\\,\\d\\:\\d{2}\\:\\d{2}\\.\\d{3}\\n", replacement = "") # Remove subtitle time codes
+str_replace_all(video_data$video_transcript, pattern = "\\.\\.\\.", replacement = "") # Remove ...
+
+# Construct documents (all text from channel details and videos within that channel)
+generate_channel_documents <- function(channel_data_df, video_data_df){
+  
+  channel_doc_df <- data.frame(stringsAsFactors = FALSE)
+  
+  # Generate videos texts column
+  videos_texts <- vector(mode = "character", length = length(channel_data_df))
+  
+  # Generate videos texts for each channel row
+  for(i in seq_along(channel_data_df$channel_id)){
+    
+    # Select all videos in this channel
+    channel_videos <- channel_videos_df[channel_videos_df$channel_id == channel_data_df$channel_id[i], ]$video_id
+    print("Channel videos:")
+    print(channel_videos)
+    
+    videos_texts[[i]] <- as.character(paste(video_data_df[video_data_df$video_id %in% channel_videos, -1], collapse = " ")) # Pasting creates three concatenations...
+    print("Video texts:")
+    print(videos_texts[[i]])
+  }
+  
+  # Merge videos texts column
+  channel_doc_df <- cbind(channel_data_df, videos_texts)
+  channel_doc_df$videos_texts <- as.character(channel_doc_df$videos_texts)
+  
+  # Return channel document data frame
+  channel_doc_df
+}
+
+left_channel_docs <- generate_channel_documents(left_channels_data, video_data)
+right_channel_docs <- generate_channel_documents(right_channels_data, video_data)
+```
+
+## Generating corpus and creating Topic Maps
+
+```{r}
+# Generate corpus
+quanteda_options("threads" = 10)
+left_corpus <- corpus(left_channel_docs, docid_field = "channel_id", text_field = "videos_texts")
+right_corpus <- corpus(right_channel_docs, docid_field = "channel_id", text_field = "videos_texts")
+
+# Generate DFMs
+left_dfm <- dfm(left_corpus, remove_punct = TRUE, remove = stopwords('en')) # %>%
+            # dfm_trim(min_termfreq = 0.95, termfreq_type = "quantile", 
+            #          max_docfreq = 0.1, docfreq_type = "prop")
+left_dfm <- left_dfm[ntoken(left_dfm) > 0,]
+
+right_dfm <- dfm(right_corpus, remove_punct = TRUE, remove = stopwords('en')) #%>%
+            # dfm_trim(min_termfreq = 0.95, termfreq_type = "quantile", 
+            #          max_docfreq = 0.1, docfreq_type = "prop")
+right_dfm <- right_dfm[ntoken(right_dfm) > 0,]
+
+# Create LDA topic model
+left_dtm <- convert(left_dfm, to = "topicmodels")
+left_lda <- LDA(left_dtm, k = 10)
+
+right_dtm <- convert(right_dfm, to = "topicmodels")
+right_lda <- LDA(right_dtm, k = 10)
+
+# List topic terms
+left_topic_terms <- terms(left_lda, 10)
+print("Left topic terms:")
+print(left_topic_terms)
+
+right_topic_terms <- terms(right_lda, 10)
+print("Right topic terms:")
+print(right_topic_terms)
+
+print(Sys.time())
+```
+
+
+## Recommendation research
+
+### Test the hunch that recommendations lead to more extreme content
+50 subjects were students (MBO, HBO) and that most of them don’t describe themselves as politically interested. It’s therefore very interesting to see what happens if they start looking for information on politically sensitive issues.
+We tweaked a script from Guillaume Chaslot, build an executable and asked subjects to run the script from their computer. We have used ten queries that were used to search YouTube and then clicked on the recommendations (depth 4). The search terms were:
+Geert Wilders, Sylvana Simons, Thierry Baudet, Kajsa Ollongren, Feminisme, Holocaust, Zwarte Piet, Eurocrisis, Islam, Vluchtelingen.
+
+```{r}
+# recommendation_files  <- list.files(path = "Local extremism data/raw/recommendations/resultaten_yt", pattern = "youtube-", recursive = TRUE)
+# recommendation_file_paths <- paste0("Local extremism data/raw/recommendations/resultaten_yt/", recommendation_files)
+# 
+# recommendation_jsons <- lapply(recommendation_file_paths[1:100], FUN = function(x) stream_in(file(x))) # Please note this is just a subset due to parsing errors due tro truncation of file path name in wondows.
+# 
+# recommendation_files_meta <- as_data_frame(recommendation_files %>%
+#                                 str_replace_all(pattern = "youtube-win-\\s?|youtube-onderzoek-mac-\\s?", replacement = "") %>%
+#                                 str_replace("-", " ") %>%
+#                                 str_replace("\\.json", "")) %>%
+#                                 separate(value, into = c("user_hash", "search"), sep = "/") %>%
+#                                 separate(search, into = c("search_string", "date"), sep = -10) %>%
+#                                 mutate(search_string = str_sub(search_string, 1, -2))
+# head(recommendation_files_meta) %>%
+#                                 mutate(date = as.Date(date))
+  
+```
+
+
+## Comparing November 2017 with August 2018
+### Test the claim of YouTube removing extreme content.
+
+```{r}
+# # November 2017 data
+# november_nodes <- read_csv("Local extremism data/graphs/network_november_2017/yt_node_table_depth1_v3.csv")
+# november_edges <- read_csv("Local extremism data/graphs/network_november_2017/yt_edge_table_depth1_v3.csv")
+# november_network_nosubs <- read_gdf("Local extremism data/graphs/network_november_2017/yt_depth1_without_subscriptions_v2.gdf")
+# november_network_subs <- read_gdf("Local extremism data/graphs/network_november_2017/yt_depth1_with_subscriptions_v2.gdf")
+# 
+# # trying to plot gdfs [IN PROGRESS]
+# interactive_graph_data <- igraph_to_networkD3(november_network_nosubs)
+# interactive_graph <- simpleNetwork(interactive_graph_data)
+# 
+# # August 2018 data
+# august_network_subs <- read_gdf("Local extremism data/graphs/network_august_2018/yt_depth1_with_subscriptions_v1_august_2018.gdf")
+```
+
